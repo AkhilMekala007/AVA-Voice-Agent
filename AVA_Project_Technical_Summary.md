@@ -407,23 +407,62 @@ The async version of `using`. Calls `DisposeAsync()` when the block exits. Used 
 - Created `AvaDbContext` with Fluent API schema config, cascade deletes, and query indexes
 - Implemented `EfCoreContextManager` using `IDbContextFactory` pattern (Singleton-safe)
 - Replaced `InMemoryContextManager` with `EfCoreContextManager` in DI registration
-- Added `EnsureCreatedAsync()` on startup — DB schema auto-created on first run
-- Wrote 7 new unit tests for `EfCoreContextManager` using the InMemory provider
-- **Total tests: 17 unit tests**
+- Fixed `ClearSessionAsync` — EF Core InMemory provider ignores cascade deletes; messages must be explicitly deleted before the session row
+- Added `localStorage` session ID persistence in browser — same `sessionId` survives page refreshes so EF Core loads the right history
+- Added **"+ New Conversation"** button to clear `localStorage` and start fresh
+- Added `ExtractNameFromText()` in `ConversationOrchestrator` — detects "Hi this is Akhil", "my name is Akhil" etc. and passes name to context manager
+- Added cross-session memory lookup in `EfCoreContextManager` — when a session has no messages but a name is known, finds the most recent prior session with that name and copies its history
+- Updated `DynamicSystemPromptBuilder` — added `YOUR MEMORY` section explicitly telling Claude it has persistent memory and must never say "I don't remember you"
+- Updated `BuildUserContext` — tells Claude exactly how many messages of history it has loaded, so it responds confidently
+- Wrote 7 new unit tests for `EfCoreContextManager`
+- **Total unit tests: 38**
+
+### Phase 5 — Integration Tests + CI/CD + Migrations
+- Set up `AVA.IntegrationTests` project with `Microsoft.AspNetCore.Mvc.Testing`, EF Core InMemory, Moq, FluentAssertions
+- Added `public partial class Program {}` to `Program.cs` — required for `WebApplicationFactory<Program>` to work
+- Wrote **7 pipeline integration tests** (`ConversationPipelineTests.cs`) — real `ConversationOrchestrator` + real `EfCoreContextManager` + real emotion classifier + real prompt builder + mocked LLM + mocked Azure. Tests cover: first message saves to DB, second message includes prior context, emotion detection, empty LLM fallback, session isolation, history persistence, system prompt contains emotion guidance
+- Wrote **8 HTTP endpoint integration tests** (`ChatEndpointTests.cs`) — boots the full ASP.NET Core app in-memory using `WebApplicationFactory`, sends real HTTP requests, asserts real JSON responses for `/chat`, `/greet`, `/ping`, `/health`
+- Created **GitHub Actions CI** (`.github/workflows/ci.yml`) — triggers on every push/PR to `main`/`develop`, runs `dotnet restore` → `dotnet build --configuration Release` → `dotnet test`, uploads test results + coverage artifacts
+- Created **EF Core initial migration** (`20240601000000_InitialCreate.cs`) + model snapshot — versioned schema management
+- Replaced `EnsureCreatedAsync()` with `MigrateAsync()` in `Program.cs`
+- Fixed `MigrateAsync` crash in tests — InMemory provider doesn't support migrations; added `if (db.Database.IsRelational())` check to use `MigrateAsync` for SQLite and `EnsureCreatedAsync` for InMemory
+- Fixed pipeline test mock interference — `RefineTranscriptAsync` and the main LLM call both hit `ILlmProvider`; split mock setup using `It.Is<string>(s => s.Contains("transcript cleaner"))` to distinguish refinement calls from conversation calls
+- Added `README.md` — full project documentation with architecture diagram, pipeline flow, setup instructions, API reference, test counts, CI badge
+- Fixed security incident — `appsettings.Development.json` was accidentally committed with real API keys; purged via `git checkout --orphan` (fresh history), rotated both Azure and Anthropic keys, added file to `.gitignore`
+- Added `workflow` scope to GitHub PAT to allow pushing `.github/workflows/` files
+- **Total tests: 53 (38 unit + 15 integration)**
 
 ---
 
 ## Current Test Count
 
-| Test File | Tests | What's Covered |
-|---|---|---|
-| VoiceTestControllerTests.cs | 10 | Transcribe (null/empty/valid/silent), Synthesize (empty/whitespace/valid), Chat ping, Greet (TTS called, non-empty text) |
-| EfCoreContextManagerTests.cs | 7 | New session, save/load messages, multiple exchanges, history trimming, session clear, session isolation, no duplicates |
-| SessionTests.cs | 2+ | Domain entity business rules |
-| AzureSpeechToTextServiceTests.cs | varies | STT service unit tests |
-| AzureTextToSpeechServiceTests.cs | varies | TTS service unit tests |
+| Suite | File | Tests | What's Covered |
+|---|---|---|---|
+| Unit | VoiceTestControllerTests.cs | 10 | Transcribe (null/empty/valid/silent), Synthesize (empty/whitespace/valid), Ping, Greet |
+| Unit | EfCoreContextManagerTests.cs | 7 | New session, save/load, ordering, history trim, clear, isolation, no duplicates |
+| Unit | SessionTests.cs | 2+ | Domain entity business rules |
+| Unit | AzureSpeechToTextServiceTests.cs | varies | STT service unit tests |
+| Unit | AzureTextToSpeechServiceTests.cs | varies | TTS service unit tests |
+| Integration | ConversationPipelineTests.cs | 7 | Full orchestrator pipeline with real EF Core + InMemory SQLite |
+| Integration | ChatEndpointTests.cs | 8 | HTTP endpoints via WebApplicationFactory |
 
 Run all tests: `dotnet test` from the `AVA/` folder.
+
+---
+
+## Bugs Fixed (Post Phase 3)
+
+**Cascade delete not working in tests** — EF Core's InMemory provider does not enforce cascade deletes (a SQL engine feature). `ClearSessionAsync` was updated to explicitly delete all messages before removing the session row, making it work in both InMemory (tests) and SQLite (production).
+
+**Session memory lost on page refresh** — `crypto.randomUUID()` ran on every page load, creating a fresh session ID each time even though history was stored in SQLite under the old ID. Fixed by persisting the session ID in `localStorage`. The same ID is reused across refreshes, so EF Core always loads the correct history.
+
+**AVA claiming no memory** — Claude's training makes it default to saying "I don't retain memory between conversations." Fixed by adding a `YOUR MEMORY` block to the system prompt that explicitly overrides this with: "You have a persistent memory system. NEVER say you don't remember the user."
+
+**MigrateAsync crash in integration tests** — `WebApplicationFactory` replaces SQLite with the EF Core InMemory provider, but `MigrateAsync()` is relational-only and throws on InMemory. Fixed with a provider check: `if (db.Database.IsRelational()) MigrateAsync() else EnsureCreatedAsync()`.
+
+**Refinement mock polluting pipeline tests** — `ConversationOrchestrator` calls the LLM twice per message: once for transcript refinement (system prompt contains "transcript cleaner") and once for the main conversation. A single catch-all mock caused refinement to return the fixture response as the "cleaned" transcript, breaking emotion detection and content assertions. Fixed by splitting mock setup using `It.Is<string>()` to match on system prompt content.
+
+**API keys committed to GitHub** — `appsettings.Development.json` was accidentally included in a git commit. GitHub push protection blocked the push and alerted on the secrets. Fixed by: (1) rotating both Azure and Anthropic API keys immediately, (2) wiping git history using `git checkout --orphan` to create a fresh single-commit history with no secrets, (3) adding `appsettings.Development.json` and `appsettings.*.json` to `.gitignore`.
 
 ---
 
@@ -443,7 +482,7 @@ Run all tests: `dotnet test` from the `AVA/` folder.
 
 ## Key Configuration Files
 
-**`appsettings.json`** (committed to GitHub — safe, no real keys)
+**`appsettings.json`** (committed to GitHub — safe, placeholder values only)
 ```json
 {
   "Azure": { "SpeechKey": "YOUR_AZURE_KEY_HERE", "SpeechRegion": "eastus" },
@@ -461,12 +500,25 @@ Run all tests: `dotnet test` from the `AVA/` folder.
 
 **SQLite database** — auto-created at `%LOCALAPPDATA%\AVA\ava_conversations.db`
 
+**EF Core migrations** — `src/AVA.Infrastructure/Migrations/` — versioned schema files
+
+**GitHub Actions CI** — `.github/workflows/ci.yml` — runs on every push to `main`/`develop`
+
 ---
 
-## What's Next — Phase 5
+## Known Issues (Parked for Future Phases)
 
-- **Integration Tests**: Test the full pipeline with a real SQLite InMemory database (no Azure mocking — use test doubles that simulate real API responses)
-- **GitHub Actions CI**: Automatically run `dotnet test` on every push to GitHub
-- **User Profile Extraction**: Parse user's name from their first message ("Hi I'm Alex") and persist it in the session
-- **Session History API**: New endpoint to retrieve past conversation summaries
-- **Proper EF Core Migrations**: Replace `EnsureCreated()` with versioned migration files for production-safe schema updates
+**Voice audio transcription not working end-to-end** — the browser correctly records audio and converts WebM/Opus → 16kHz PCM WAV using `AudioContext` + `OfflineAudioContext`. The WAV is posted to `/api/voicetest/transcribe` which sends it to Azure STT. Azure returns an empty transcript despite the audio being captured (~50KB). Root cause is likely an audio format mismatch or microphone permission issue. Parked for Phase 7 deep dive.
+
+**Cross-session memory by name needs refinement** — the `ExtractNameFromText` regex catches common intro patterns ("Hi this is Akhil") but misses less common ones. The cross-session history import works when the name is extracted, but relies on the user having previously used the same name. Phase 6 user authentication will make this fully reliable.
+
+---
+
+## What's Next
+
+| Phase | Description |
+|---|---|
+| Phase 6 | User authentication — email/password or OAuth so AVA knows who you are without introductions, making cross-session memory fully reliable |
+| Phase 7 | Fix voice audio transcription — deep dive into WebM → PCM WAV conversion and Azure STT format requirements |
+| Phase 8 | Azure deployment — App Service + Azure SQL (replace SQLite), environment secrets via Key Vault |
+| Phase 9 | Mobile-friendly UI or React frontend replacement for the current vanilla HTML test page |

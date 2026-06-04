@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AVA - Emotional Support Voice Agent</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 24px; max-width: 780px; }
+        h1   { color: #7eb8f7; margin-bottom: 4px; font-size: 1.6em; }
+        .sub { color: #666; font-size: 0.85em; margin-bottom: 20px; }
+
+        .chat-box {
+            background: #0d0d1a; border-radius: 10px; padding: 16px;
+            height: 340px; overflow-y: auto; margin-bottom: 14px;
+            border: 1px solid #2a2a4a;
+        }
+        .msg { margin: 10px 0; line-height: 1.55; }
+        .msg.you  { color: #7eb8f7; }
+        .msg.ava  { color: #56d364; }
+        .msg.info { color: #555; font-size: 0.82em; font-style: italic; }
+        .msg.err  { color: #f47067; }
+        .label    { font-weight: 600; margin-right: 6px; }
+
+        audio { width: 100%; margin: 10px 0; border-radius: 6px; display: none; }
+
+        .controls { display: flex; gap: 10px; align-items: center; }
+        input[type=text] {
+            flex: 1; padding: 12px 14px; background: #1e1e3a;
+            border: 1px solid #3a3a6a; color: #e0e0e0;
+            border-radius: 8px; font-size: 1em;
+        }
+        input:focus { outline: none; border-color: #7eb8f7; }
+
+        .btn {
+            padding: 12px 18px; border: none; border-radius: 8px;
+            cursor: pointer; font-size: 0.95em; font-weight: 600;
+            transition: background 0.2s;
+        }
+        .btn-send { background: #1f5799; color: #fff; }
+        .btn-send:hover:not(:disabled) { background: #2a6fbf; }
+        .btn-mic  { background: #2a2a2a; color: #e0e0e0; font-size: 1.3em; padding: 12px 15px; }
+        .btn-mic.recording { background: #8b0000; animation: pulse 1s infinite; }
+        .btn:disabled { background: #2a2a2a; color: #555; cursor: not-allowed; }
+
+        @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.5; } }
+
+        .emotion-chip {
+            display: inline-block; padding: 2px 10px; border-radius: 10px;
+            background: #2a2a1a; color: #d4b83a; font-size: 0.78em; margin-left: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div>
+            <h1>AVA</h1>
+            <p class="sub">Emotional Support Voice Agent · Phase 4</p>
+        </div>
+        <button class="btn" id="btnNew"
+                style="background:#2a2a2a; color:#aaa; font-size:0.8em; padding:8px 14px;"
+                onclick="startNewSession()"
+                title="Clear memory and start a fresh conversation">
+            ＋ New Conversation
+        </button>
+    </div>
+
+    <div class="chat-box" id="chat">
+        <div class="msg info">Connecting to AVA…</div>
+    </div>
+
+    <audio id="player" controls></audio>
+
+    <div class="controls">
+        <!-- Mic button: hold to record, release to send -->
+        <button class="btn btn-mic" id="btnMic"
+                onmousedown="startRecording()" onmouseup="stopRecording()"
+                ontouchstart="startRecording()" ontouchend="stopRecording()"
+                title="Hold to speak">🎤</button>
+
+        <input type="text" id="msgInput"
+               placeholder="Or type here and press Enter…"
+               onkeydown="if(event.key==='Enter') sendText()" />
+
+        <button class="btn btn-send" id="btnSend" onclick="sendText()">Send</button>
+    </div>
+
+    <script>
+        // ── SESSION IDENTITY ─────────────────────────────────────────────────
+        // Persist the sessionId in localStorage so AVA remembers the user
+        // across page refreshes and browser restarts.
+        //
+        // WHY localStorage?
+        // Before this fix: crypto.randomUUID() ran on every page load, generating
+        // a fresh Guid each time. Even though EF Core stored the conversation in
+        // SQLite under the old Guid, the new page load used a different Guid —
+        // so EF Core returned an empty history and AVA started fresh every time.
+        //
+        // With localStorage: the Guid is generated ONCE and stored in the browser.
+        // Every subsequent page load reads the same Guid → EF Core finds the same
+        // session row → loads the full conversation history → AVA remembers.
+        //
+        // HOW TO START A FRESH CONVERSATION:
+        // Open browser DevTools → Application → Local Storage → delete 'ava_session_id'
+        // Then refresh the page. A new session will be created.
+        const storedId = localStorage.getItem('ava_session_id');
+        const sessionId = storedId ?? crypto.randomUUID();
+        if (!storedId) localStorage.setItem('ava_session_id', sessionId);
+
+        let mediaRecorder = null;
+        let audioChunks   = [];
+        let isRecording   = false;
+
+        // ── NEW CONVERSATION ─────────────────────────────────────────────────
+        // Wipes localStorage so a fresh sessionId is created on next load,
+        // then reloads the page. AVA will greet the user as a new visitor.
+        function startNewSession() {
+            if (!confirm('Start a new conversation? AVA will forget this session.')) return;
+            localStorage.removeItem('ava_session_id');
+            location.reload();
+        }
+
+        // ── GREETING ON PAGE LOAD ────────────────────────────────────────────
+        // Called once when the DOM is ready. Fetches AVA's opening greeting
+        // from the server (synthesized in her actual voice) and auto-plays it.
+        //
+        // WHY AUTO-PLAY?
+        // A voice agent that opens in silence feels broken. The greeting
+        // sets the tone — the user immediately hears AVA's warm voice and
+        // knows the system is working before they say anything.
+        //
+        // AUTOPLAY POLICY NOTE:
+        // Chrome blocks audio autoplay until the user has interacted with the page.
+        // We attempt play() — if it's blocked, we show a "Click ▶ to hear AVA"
+        // message so the user knows audio is ready. This is the correct pattern.
+        document.addEventListener('DOMContentLoaded', () => greetOnLoad());
+
+        async function greetOnLoad() {
+            setBusy(true);
+            try {
+                const res  = await fetch('/api/voicetest/greet');
+                const data = await res.json();
+
+                if (!data.success) {
+                    log('You can type a message or click 🎤 to speak.', 'info');
+                    return;
+                }
+
+                // Show AVA's greeting text in the chat
+                log('<span class="label">AVA:</span>' + data.greetingText, 'ava');
+
+                // Decode base64 WAV and play it
+                const binary = atob(data.audioBase64);
+                const bytes  = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+                const blob   = new Blob([bytes], { type: data.audioMimeType });
+                const url    = URL.createObjectURL(blob);
+                const player = document.getElementById('player');
+                player.src   = url;
+                player.style.display = 'block';
+
+                // Try to autoplay — Chrome may block it on first load
+                player.play().catch(() =>
+                    log('Click ▶ above to hear AVA\'s greeting.', 'info')
+                );
+
+            } catch (err) {
+                // Greeting failure is non-fatal — user can still type or speak
+                log('You can type a message or click 🎤 to speak.', 'info');
+                console.warn('Greeting failed:', err.message);
+            } finally {
+                setBusy(false);
+            }
+        }
+
+        function log(text, type = 'info') {
+            const box = document.getElementById('chat');
+            const d   = document.createElement('div');
+            d.className = 'msg ' + type;
+            d.innerHTML = text;
+            box.appendChild(d);
+            box.scrollTop = box.scrollHeight;
+        }
+
+        // ── TEXT INPUT ───────────────────────────────────────────────────
+        async function sendText() {
+            const input = document.getElementById('msgInput');
+            const text  = input.value.trim();
+            if (!text) return;
+            input.value = '';
+            await sendToAva(text);
+        }
+
+        // ── VOICE INPUT ──────────────────────────────────────────────────
+        async function startRecording() {
+            if (isRecording) return;
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                audioChunks  = [];
+                mediaRecorder = new MediaRecorder(stream);
+                mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
+                mediaRecorder.start();
+                isRecording = true;
+                document.getElementById('btnMic').classList.add('recording');
+                document.getElementById('btnMic').textContent = '⏹';
+                log('Recording… release the button when done.', 'info');
+            } catch (err) {
+                if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+                    log('❌ Microphone blocked. To fix: click the 🔒 icon in the address bar → Site Settings → Microphone → Allow → refresh the page.', 'err');
+                } else {
+                    log('Microphone error: ' + err.message, 'err');
+                }
+            }
+        }
+
+        async function stopRecording() {
+            if (!isRecording || !mediaRecorder) return;
+            isRecording = false;
+            document.getElementById('btnMic').classList.remove('recording');
+            document.getElementById('btnMic').textContent = '🎤';
+
+            mediaRecorder.stop();
+            mediaRecorder.stream.getTracks().forEach(t => t.stop());
+
+            // Wait for final ondataavailable
+            await new Promise(r => mediaRecorder.onstop = r);
+
+            const rawBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+            log('Audio recorded (' + Math.round(rawBlob.size / 1024) + ' KB). Converting to PCM…', 'info');
+
+            // Convert browser WebM/Opus → raw 16kHz 16-bit mono PCM WAV
+            // WHY? Azure STT PushAudioInputStream expects raw PCM (16kHz, 16-bit, mono).
+            // Browsers record in WebM/Opus by default — Azure cannot decode this format.
+            // We use AudioContext to decode + resample, then build a proper WAV file.
+            let wavBlob;
+            try {
+                wavBlob = await convertToWav(rawBlob);
+                log('Converted to WAV (' + Math.round(wavBlob.size / 1024) + ' KB). Transcribing…', 'info');
+            } catch(e) {
+                log('Audio conversion failed: ' + e.message, 'err');
+                setBusy(false);
+                return;
+            }
+
+            // Send to /transcribe → get text → send to AVA
+            const formData = new FormData();
+            formData.append('audioFile', wavBlob, 'recording.wav');
+
+            try {
+                setBusy(true);
+                const res  = await fetch('/api/voicetest/transcribe', { method: 'POST', body: formData });
+                const data = await res.json();
+
+                if (data.success && data.transcript) {
+                    log('<span class="label">You (voice):</span>' + data.transcript, 'you');
+                    await sendToAva(data.transcript, /* alreadyLogged= */ true);
+                } else {
+                    log('Could not transcribe audio. Try speaking more clearly or use text.', 'err');
+                    setBusy(false);
+                }
+            } catch (err) {
+                log('Transcription error: ' + err.message, 'err');
+                setBusy(false);
+            }
+        }
+
+        // ── CORE: send text through full AVA pipeline ────────────────────
+        async function sendToAva(text, alreadyLogged = false) {
+            setBusy(true);
+            if (!alreadyLogged) log('<span class="label">You:</span>' + text, 'you');
+            log('AVA is thinking…', 'info');
+
+            try {
+                const res = await fetch('/api/voicetest/chat', {
+                    method:  'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body:    JSON.stringify({ text, sessionId })
+                });
+
+                const raw = await res.text();
+
+                let data;
+                try { data = JSON.parse(raw); }
+                catch { log('Server error: ' + raw.substring(0, 300), 'err'); setBusy(false); return; }
+
+                if (!res.ok || !data.success) {
+                    log('Error: ' + (data.error || data.message || 'Unknown'), 'err');
+                    setBusy(false);
+                    return;
+                }
+
+                // Show AVA's text response
+                const chip = data.emotion ? `<span class="emotion-chip">${data.emotion}</span>` : '';
+                log('<span class="label">AVA:</span>' + data.response + chip, 'ava');
+                if (data.latencyMs) log('Pipeline latency: ' + data.latencyMs + 'ms', 'info');
+
+                // Decode base64 audio and play via native <audio> element
+                // Base64 → binary string → Uint8Array → Blob → Object URL
+                const binary = atob(data.audioBase64);
+                const bytes  = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+                const blob   = new Blob([bytes], { type: data.audioMimeType });
+                const url    = URL.createObjectURL(blob);
+                const player = document.getElementById('player');
+                player.src   = url;
+                player.style.display = 'block';
+                player.play().catch(() => log('Click ▶ on the player to hear AVA.', 'info'));
+
+            } catch (err) {
+                log('Network error: ' + err.message, 'err');
+            } finally {
+                setBusy(false);
+            }
+        }
+
+        function setBusy(busy) {
+            document.getElementById('btnSend').disabled = busy;
+            document.getElementById('msgInput').disabled = busy;
+            document.getElementById('btnMic').disabled   = busy;
+        }
+
+        // ── AUDIO CONVERSION: WebM/Opus → 16kHz 16-bit mono PCM WAV ─────────
+        //
+        // WHY THIS IS NEEDED:
+        // Browser MediaRecorder records in WebM/Opus by default.
+        // Azure STT's PushAudioInputStream expects 16kHz 16-bit mono PCM (raw WAV).
+        // These are completely different formats — Azure cannot decode WebM.
+        //
+        // HOW IT WORKS:
+        // 1. AudioContext.decodeAudioData()  — browser decodes WebM/Opus → Float32 PCM
+        // 2. AudioContext({ sampleRate: 16000 }) — tells the browser to resample to 16kHz
+        // 3. getChannelData(0)               — grab mono channel (downmix if stereo)
+        // 4. Float32 → Int16                 — Azure expects 16-bit signed integers
+        // 5. createWavBuffer()               — prepend 44-byte RIFF/WAV header
+        //
+        // WHY AudioContext({ sampleRate: 16000 })?
+        // Some browsers resample on decode if the context sample rate differs from
+        // the source. This is the simplest cross-browser resampling trick.
+        // If the browser ignores the hint (Firefox sometimes does), we create a
+        // second AudioContext at 16kHz and use OfflineAudioContext to resample.
+        async function convertToWav(audioBlob) {
+            const arrayBuffer = await audioBlob.arrayBuffer();
+
+            // Step 1: Decode the WebM/Opus audio
+            const decodeCtx = new AudioContext();
+            const decoded   = await decodeCtx.decodeAudioData(arrayBuffer);
+            decodeCtx.close();
+
+            // Step 2: Resample to 16kHz using OfflineAudioContext
+            // OfflineAudioContext renders the audio at a specific sample rate offline
+            // (no real-time playback) — perfect for format conversion.
+            const targetSampleRate = 16000;
+            const numFrames        = Math.ceil(decoded.duration * targetSampleRate);
+            const offlineCtx       = new OfflineAudioContext(1, numFrames, targetSampleRate);
+
+            const source = offlineCtx.createBufferSource();
+            source.buffer = decoded;
+            source.connect(offlineCtx.destination);
+            source.start(0);
+
+            const resampled = await offlineCtx.startRendering();
+
+            // Step 3: Get mono channel data (Float32Array, values -1.0 to +1.0)
+            const pcmFloat = resampled.getChannelData(0);
+
+            // Step 4: Convert Float32 → Int16
+            // Float32 range: -1.0 to +1.0
+            // Int16 range:   -32768 to +32767
+            // Formula: clamp to [-1,1] then multiply by 32767
+            const pcmInt16 = new Int16Array(pcmFloat.length);
+            for (let i = 0; i < pcmFloat.length; i++) {
+                const clamped = Math.max(-1, Math.min(1, pcmFloat[i]));
+                pcmInt16[i]   = clamped < 0 ? clamped * 32768 : clamped * 32767;
+            }
+
+            // Step 5: Wrap in WAV container and return as Blob
+            const wavBuffer = createWavBuffer(pcmInt16, targetSampleRate, 1);
+            return new Blob([wavBuffer], { type: 'audio/wav' });
+        }
+
+        // Build a valid RIFF/WAV file from raw Int16 PCM data.
+        //
+        // WAV file layout (44-byte header + PCM data):
+        //   Offset  Size  Field
+        //   0       4     "RIFF"
+        //   4       4     Total file size - 8  (little-endian uint32)
+        //   8       4     "WAVE"
+        //   12      4     "fmt "
+        //   16      4     16 (size of fmt chunk)
+        //   20      2     1 = PCM (uncompressed)
+        //   22      2     channels
+        //   24      4     sampleRate
+        //   28      4     byteRate = sampleRate * channels * bitsPerSample/8
+        //   32      2     blockAlign = channels * bitsPerSample/8
+        //   34      2     bitsPerSample (16)
+        //   36      4     "data"
+        //   40      4     data chunk size in bytes
+        //   44+     N     raw PCM samples
+        function createWavBuffer(pcmData, sampleRate, channels) {
+            const bitsPerSample = 16;
+            const byteRate      = sampleRate * channels * (bitsPerSample / 8);
+            const blockAlign    = channels * (bitsPerSample / 8);
+            const dataSize      = pcmData.byteLength;
+            const buffer        = new ArrayBuffer(44 + dataSize);
+            const view          = new DataView(buffer);
+
+            const writeStr = (offset, s) => {
+                for (let i = 0; i < s.length; i++)
+                    view.setUint8(offset + i, s.charCodeAt(i));
+            };
+
+            writeStr(0,  'RIFF');
+            view.setUint32( 4,  36 + dataSize, true);   // file size - 8
+            writeStr(8,  'WAVE');
+            writeStr(12, 'fmt ');
+            view.setUint32(16, 16, true);                // fmt chunk size
+            view.setUint16(20,  1, true);                // PCM = 1
+            view.setUint16(22, channels, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, byteRate, true);
+            view.setUint16(32, blockAlign, true);
+            view.setUint16(34, bitsPerSample, true);
+            writeStr(36, 'data');
+            view.setUint32(40, dataSize, true);
+
+            // Copy PCM samples into the buffer after the header
+            new Uint8Array(buffer, 44).set(new Uint8Array(pcmData.buffer));
+
+            return buffer;
+        }
+    </script>
+</body>
+</html>

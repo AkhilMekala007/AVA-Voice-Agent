@@ -1,0 +1,83 @@
+# AVA CI Pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+# Runs automatically on every push and pull request to main/develop.
+# Ensures the codebase always builds and all tests pass before merging.
+#
+# JOBS:
+#   build-and-test — builds the solution and runs all unit + integration tests
+#
+# NOTE ON API KEYS:
+# Unit and integration tests use mocks for all external services (Azure, Claude).
+# No real API keys are needed in CI — the tests run without any secrets.
+# Real keys only live in appsettings.Development.json which is gitignored.
+
+name: CI — Build & Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  build-and-test:
+    name: Build & Test (.NET 8)
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Step 1: Check out the repository ──────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Step 2: Install .NET 8 SDK ─────────────────────────────────────────
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # ── Step 3: Restore NuGet packages ────────────────────────────────────
+      # Downloads all packages defined in .csproj files.
+      # Cached by GitHub Actions between runs for speed.
+      - name: Restore dependencies
+        run: dotnet restore
+
+      # ── Step 4: Build the entire solution ─────────────────────────────────
+      # --no-restore: skip restore (already done above)
+      # --configuration Release: use Release config (same as production)
+      # Fails the pipeline immediately if any project has a compile error.
+      - name: Build solution
+        run: dotnet build --no-restore --configuration Release
+
+      # ── Step 5: Run all tests ──────────────────────────────────────────────
+      # Runs both AVA.UnitTests and AVA.IntegrationTests.
+      # --no-build: skip rebuild (already built above)
+      # --verbosity normal: show individual test names + pass/fail
+      # --logger: outputs results in GitHub Actions format for inline PR annotations
+      - name: Run tests
+        run: >
+          dotnet test
+          --no-build
+          --configuration Release
+          --verbosity normal
+          --logger "trx;LogFileName=test-results.trx"
+          --collect:"XPlat Code Coverage"
+
+      # ── Step 6: Publish test results ──────────────────────────────────────
+      # Uploads the .trx test results file as a build artifact.
+      # Visible in the GitHub Actions run under "Artifacts".
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()   # Upload even if tests fail — so we can inspect failures
+        with:
+          name: test-results
+          path: '**/test-results.trx'
+          retention-days: 7
+
+      # ── Step 7: Publish code coverage ─────────────────────────────────────
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: '**/coverage.cobertura.xml'
+          retention-days: 7
